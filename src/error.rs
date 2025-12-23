@@ -30,4 +30,16 @@ pub enum Error {
 
     #[error("Regex error: {0}")]
     Regex(#[from] regex::Error),
+
+    #[error("SQL error: {0}")]
+    Sql(String),
+
+    #[error("Write operation not allowed: {0}")]
+    WriteNotAllowed(String),
+
+    #[error("Dangerous operation rejected: {0}")]
+    DangerousOperation(String),
+
+    #[error("Backup failed: {0}")]
+    BackupFailed(String),
 }

@@ -149,6 +149,28 @@ enum Commands {
         /// Show variants in each cluster
         #[arg(long)]
         show_variants: bool,
+
+        /// Sort by: count (default) or latest
+        #[arg(short, long, default_value = "count")]
+        sort: String,
+
+        /// Minimum prompt length in characters
+        #[arg(long, default_value = "4")]
+        min_length: usize,
+    },
+
+    /// Execute SQL queries on Claude Code data
+    Sql {
+        /// SQL query to execute (e.g., "SELECT * FROM history LIMIT 10")
+        query: String,
+
+        /// Enable write operations (INSERT, UPDATE, DELETE)
+        #[arg(long)]
+        write: bool,
+
+        /// Preview what would be modified without making changes
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -238,9 +260,18 @@ async fn main() -> Result<()> {
             min_count,
             limit,
             show_variants,
+            sort,
+            min_length,
         } => {
-            commands::duplicates(&config, threshold, min_count, limit, show_variants, cli.format)
+            commands::duplicates(&config, threshold, min_count, limit, show_variants, &sort, min_length, cli.format)
                 .await?;
+        }
+        Commands::Sql {
+            query,
+            write,
+            dry_run,
+        } => {
+            commands::sql(&config, &query, write, dry_run, cli.format).await?;
         }
     }
 

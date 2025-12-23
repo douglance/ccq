@@ -6,6 +6,7 @@ pub mod error;
 pub mod models;
 pub mod query;
 pub mod search;
+pub mod sql;
 pub mod streaming;
 
 pub use config::Config;

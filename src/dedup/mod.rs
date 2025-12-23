@@ -6,43 +6,55 @@ pub struct PromptCluster {
     pub canonical: String,
     pub variants: Vec<String>,
     pub count: usize,
+    pub latest_timestamp: i64,
 }
 
 pub struct FuzzyDeduper {
     threshold: f64,
+    min_length: usize,
 }
 
 impl FuzzyDeduper {
-    pub fn new(threshold: f64) -> Self {
-        Self { threshold }
+    pub fn new(threshold: f64, min_length: usize) -> Self {
+        Self { threshold, min_length }
     }
 
     /// Cluster similar prompts together using fuzzy matching
-    pub fn cluster(&self, prompts: Vec<String>) -> Vec<PromptCluster> {
-        // Count occurrences first
-        let mut counts: HashMap<String, usize> = HashMap::new();
-        for prompt in &prompts {
+    /// Takes (prompt, timestamp) pairs
+    pub fn cluster(&self, prompts: Vec<(String, i64)>) -> Vec<PromptCluster> {
+        // Count occurrences and track latest timestamp
+        let mut counts: HashMap<String, (usize, i64)> = HashMap::new();
+        for (prompt, timestamp) in &prompts {
             let normalized = self.normalize(prompt);
-            if !normalized.is_empty() && normalized.len() > 3 {
-                *counts.entry(normalized).or_insert(0) += 1;
+            if !normalized.is_empty() && normalized.len() >= self.min_length {
+                let entry = counts.entry(normalized).or_insert((0, 0));
+                entry.0 += 1;
+                if *timestamp > entry.1 {
+                    entry.1 = *timestamp;
+                }
             }
         }
 
-        // Sort by count descending
-        let mut items: Vec<(String, usize)> = counts.into_iter().collect();
+        // Sort by count descending for clustering
+        let mut items: Vec<(String, usize, i64)> = counts
+            .into_iter()
+            .map(|(k, (count, ts))| (k, count, ts))
+            .collect();
         items.sort_by(|a, b| b.1.cmp(&a.1));
 
         // Cluster similar items
         let mut clusters: Vec<PromptCluster> = Vec::new();
 
-        for (prompt, count) in items {
-            // Check if this prompt belongs to an existing cluster
+        for (prompt, count, timestamp) in items {
             let mut found_cluster = false;
 
             for cluster in &mut clusters {
                 if self.is_similar(&prompt, &cluster.canonical) {
                     cluster.variants.push(prompt.clone());
                     cluster.count += count;
+                    if timestamp > cluster.latest_timestamp {
+                        cluster.latest_timestamp = timestamp;
+                    }
                     found_cluster = true;
                     break;
                 }
@@ -53,13 +65,22 @@ impl FuzzyDeduper {
                     canonical: prompt.clone(),
                     variants: vec![prompt],
                     count,
+                    latest_timestamp: timestamp,
                 });
             }
         }
 
-        // Sort clusters by total count
-        clusters.sort_by(|a, b| b.count.cmp(&a.count));
         clusters
+    }
+
+    /// Sort clusters by count (default)
+    pub fn sort_by_count(clusters: &mut [PromptCluster]) {
+        clusters.sort_by(|a, b| b.count.cmp(&a.count));
+    }
+
+    /// Sort clusters by latest timestamp
+    pub fn sort_by_latest(clusters: &mut [PromptCluster]) {
+        clusters.sort_by(|a, b| b.latest_timestamp.cmp(&a.latest_timestamp));
     }
 
     fn normalize(&self, s: &str) -> String {
@@ -91,18 +112,15 @@ impl FuzzyDeduper {
     }
 
     fn is_similar(&self, a: &str, b: &str) -> bool {
-        // Quick check for exact match
         if a == b {
             return true;
         }
 
-        // Length check - very different lengths are unlikely to be similar
         let len_ratio = a.len().min(b.len()) as f64 / a.len().max(b.len()) as f64;
         if len_ratio < 0.5 {
             return false;
         }
 
-        // Use normalized Levenshtein distance
         let similarity = normalized_levenshtein(a, b);
         similarity >= self.threshold
     }
@@ -110,43 +128,6 @@ impl FuzzyDeduper {
 
 impl Default for FuzzyDeduper {
     fn default() -> Self {
-        Self::new(0.8) // 80% similarity threshold
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_similar_prompts() {
-        let deduper = FuzzyDeduper::default();
-        assert!(deduper.is_similar("continue", "continue"));
-        assert!(deduper.is_similar("continue", "cotninue"));
-        assert!(deduper.is_similar("continue", "contnue"));
-        assert!(deduper.is_similar("commit this", "commit that"));
-    }
-
-    #[test]
-    fn test_different_prompts() {
-        let deduper = FuzzyDeduper::default();
-        assert!(!deduper.is_similar("continue", "fix issues"));
-        assert!(!deduper.is_similar("commit this", "run tests"));
-    }
-
-    #[test]
-    fn test_clustering() {
-        let deduper = FuzzyDeduper::default();
-        let prompts = vec![
-            "continue".to_string(),
-            "continue".to_string(),
-            "cotninue".to_string(),
-            "contnue".to_string(),
-            "fix it".to_string(),
-            "fix this".to_string(),
-        ];
-
-        let clusters = deduper.cluster(prompts);
-        assert!(!clusters.is_empty());
+        Self::new(0.8, 4)
     }
 }

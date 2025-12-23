@@ -42,12 +42,17 @@ regex = "1.10"
 # Fuzzy matching
 strsim = "0.11"
 
+# SQL query engine with JSON/JSONL storage
+gluesql = "0.16"
+gluesql-json-storage = "0.16"
+
 # File operations
 walkdir = "2.4"
 glob = "0.3"
 
 # Time handling
 chrono = { version = "0.4", features = ["serde"] }
+async-trait = "0.1.89"
 
 [dev-dependencies]
 tempfile = "3.8"

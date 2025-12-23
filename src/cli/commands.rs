@@ -5,6 +5,7 @@ use crate::error::Result;
 use crate::models::TodoStatus;
 use crate::query::QueryEngine;
 use crate::search::SearchEngine;
+use crate::sql::{SqlEngine, SqlOptions};
 use comfy_table::Cell;
 
 pub async fn prompts(
@@ -459,6 +460,8 @@ pub async fn duplicates(
     min_count: usize,
     limit: usize,
     show_variants: bool,
+    sort: &str,
+    min_length: usize,
     format: OutputFormat,
 ) -> Result<()> {
     use crate::dedup::FuzzyDeduper;
@@ -466,10 +469,20 @@ pub async fn duplicates(
     let history = HistoryDataSource::new(config.clone());
     let entries = history.filter_prompts().await?;
 
-    let prompts: Vec<String> = entries.iter().map(|e| e.display.clone()).collect();
+    // Include timestamps for sorting
+    let prompts: Vec<(String, i64)> = entries
+        .iter()
+        .map(|e| (e.display.clone(), e.timestamp))
+        .collect();
 
-    let deduper = FuzzyDeduper::new(threshold);
-    let clusters = deduper.cluster(prompts);
+    let deduper = FuzzyDeduper::new(threshold, min_length);
+    let mut clusters = deduper.cluster(prompts);
+
+    // Sort based on user preference
+    match sort {
+        "latest" => FuzzyDeduper::sort_by_latest(&mut clusters),
+        _ => FuzzyDeduper::sort_by_count(&mut clusters),
+    }
 
     let filtered: Vec<_> = clusters
         .into_iter()
@@ -487,6 +500,7 @@ pub async fn duplicates(
                     serde_json::json!({
                         "prompt": c.canonical,
                         "count": c.count,
+                        "latest": c.latest_timestamp,
                         "variants": c.variants
                     })
                 })
@@ -498,32 +512,59 @@ pub async fn duplicates(
                 writer.write_json(&serde_json::json!({
                     "prompt": cluster.canonical,
                     "count": cluster.count,
+                    "latest": cluster.latest_timestamp,
                     "variants": cluster.variants
                 }))?;
             }
         }
         OutputFormat::Table => {
             let mut table = create_table();
-            if show_variants {
+            if sort == "latest" {
+                if show_variants {
+                    table.set_header(vec!["Last Used", "Count", "Prompt", "Variants"]);
+                } else {
+                    table.set_header(vec!["Last Used", "Count", "Prompt"]);
+                }
+            } else if show_variants {
                 table.set_header(vec!["Count", "Prompt", "Variants"]);
             } else {
                 table.set_header(vec!["Count", "Prompt"]);
             }
 
             for cluster in &filtered {
-                if show_variants {
-                    let variants_str = if cluster.variants.len() > 1 {
-                        cluster
-                            .variants
-                            .iter()
-                            .filter(|v| *v != &cluster.canonical)
-                            .take(3)
-                            .cloned()
-                            .collect::<Vec<_>>()
-                            .join(", ")
+                let time_str = chrono::DateTime::from_timestamp_millis(cluster.latest_timestamp)
+                    .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+                    .unwrap_or_else(|| "-".to_string());
+
+                let variants_str = if cluster.variants.len() > 1 {
+                    cluster
+                        .variants
+                        .iter()
+                        .filter(|v| *v != &cluster.canonical)
+                        .take(3)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                } else {
+                    "-".to_string()
+                };
+
+                if sort == "latest" {
+                    if show_variants {
+                        table.add_row(vec![
+                            Cell::new(&time_str),
+                            Cell::new(cluster.count),
+                            Cell::new(truncate_string(&cluster.canonical, 40)),
+                            Cell::new(truncate_string(&variants_str, 30)),
+                        ]);
                     } else {
-                        "-".to_string()
-                    };
+                        table.add_row(vec![
+                            Cell::new(&time_str),
+                            Cell::new(cluster.count),
+                            Cell::new(truncate_string(&cluster.canonical, 60)),
+                        ]);
+                    }
+                } else if show_variants {
                     table.add_row(vec![
                         Cell::new(cluster.count),
                         Cell::new(truncate_string(&cluster.canonical, 50)),
@@ -539,11 +580,94 @@ pub async fn duplicates(
 
             writer.write_table(table)?;
             writer.writeln(&format!(
-                "\nShowing {} clusters (min count: {}, threshold: {:.0}%)",
+                "\nShowing {} clusters (min count: {}, min length: {} chars, threshold: {:.0}%, sort: {})",
                 filtered.len(),
                 min_count,
-                threshold * 100.0
+                min_length,
+                threshold * 100.0,
+                sort
             ))?;
+        }
+    }
+
+    Ok(())
+}
+
+pub async fn sql(
+    config: &Config,
+    query_str: &str,
+    write_enabled: bool,
+    dry_run: bool,
+    format: OutputFormat,
+) -> Result<()> {
+    let options = SqlOptions {
+        write_enabled,
+        dry_run,
+    };
+
+    let mut engine = SqlEngine::new(config.clone(), options)?;
+
+    if dry_run && crate::sql::is_write_operation_public(query_str) {
+        let mut writer = OutputWriter::new(std::io::stdout(), format);
+        writer.writeln("[DRY RUN] Would execute:")?;
+        writer.writeln(query_str)?;
+        writer.writeln("\nNo changes made. Remove --dry-run to execute.")?;
+        return Ok(());
+    }
+
+    let results = engine.execute(query_str).await?;
+
+    let mut writer = OutputWriter::new(std::io::stdout(), format);
+
+    match format {
+        OutputFormat::Json => {
+            writer.write_json(&results)?;
+        }
+        OutputFormat::Raw | OutputFormat::Jsonl => {
+            for result in &results {
+                writer.write_json(result)?;
+            }
+        }
+        OutputFormat::Table => {
+            if results.is_empty() {
+                writer.writeln("No results.")?;
+            } else {
+                // Try to build a table from the first result's keys
+                if let Some(first) = results.first() {
+                    if let Some(obj) = first.as_object() {
+                        let headers: Vec<&str> = obj.keys().map(|s| s.as_str()).collect();
+                        let mut table = create_table();
+                        table.set_header(headers.clone());
+
+                        for result in &results {
+                            if let Some(obj) = result.as_object() {
+                                let row: Vec<Cell> = headers
+                                    .iter()
+                                    .map(|h| {
+                                        let val = obj.get(*h).unwrap_or(&serde_json::Value::Null);
+                                        let display = match val {
+                                            serde_json::Value::String(s) => truncate_string(s, 50),
+                                            serde_json::Value::Null => "-".to_string(),
+                                            _ => truncate_string(&val.to_string(), 50),
+                                        };
+                                        Cell::new(display)
+                                    })
+                                    .collect();
+                                table.add_row(row);
+                            }
+                        }
+
+                        writer.write_table(table)?;
+                        writer.writeln(&format!("\n{} row(s)", results.len()))?;
+                    } else {
+                        // Not an object, just print as JSON
+                        for result in &results {
+                            let json = serde_json::to_string_pretty(result)?;
+                            writer.writeln(&json)?;
+                        }
+                    }
+                }
+            }
         }
     }
 
